@@ -1,0 +1,2 @@
+python-telegram-bot>=20,<22
+psutil>=5.9

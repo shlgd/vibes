@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+vibes — управление Telegram-ботом (запуск в фоне / статус / стоп).
+
+Команды:
+  vibes            # то же что vibes start
+  vibes start      # запустить бота в фоне
+  vibes status     # показать статус (pid/ресурсы)
+  vibes stop       # остановить бота
+  vibes init       # создать .env по шаблону
+  vibes setup      # интерактивно создать/обновить .env
+  vibes logs       # показать путь к daemon.log (и tail -f)
+  vibes help       # показать справку (vibes help <command>)
+  vibes -r         # запустить с рестартом (остановить и запустить заново)
+
+По умолчанию ищет конфиг в файле .env рядом с этим скриптом.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import getpass
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional, Sequence
+
+
+ENV_TOKEN_KEYS: tuple[str, ...] = (
+    "VIBES_TOKEN",
+    "VIBES_TELEGRAM_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "BOT_TOKEN",
+    "TALKING_TOKEN",
+    "TALKING",
+    "Talking",
+)
+
+ENV_ADMIN_KEYS: tuple[str, ...] = (
+    "VIBES_ADMIN_ID",
+    "VIBES_TELEGRAM_ADMIN_ID",
+    "TELEGRAM_ADMIN_ID",
+    "ADMIN_ID",
+)
+
+ENV_PYTHON_KEYS: tuple[str, ...] = (
+    "VIBES_PYTHON",
+    "VIBES_PYTHON_BIN",
+)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _runtime_dir(root: Path) -> Path:
+    return root / ".vibes"
+
+
+def _state_path(runtime_dir: Path) -> Path:
+    return runtime_dir / "daemon.json"
+
+
+def _daemon_log_path(runtime_dir: Path) -> Path:
+    return runtime_dir / "daemon.log"
+
+
+def _default_env_path(root: Path) -> Path:
+    return root / ".env"
+
+
+def _parse_env_file(path: Path) -> Dict[str, str]:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+
+    out: Dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+
+        if value and value[0] not in ("'", '"'):
+            idx = value.find(" #")
+            if idx != -1:
+                value = value[:idx].rstrip()
+
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+
+        out[key] = value
+    return out
+
+
+def _pick_str(cli_value: Optional[str], file_env: Dict[str, str], keys: Sequence[str]) -> Optional[str]:
+    if isinstance(cli_value, str) and cli_value.strip():
+        return cli_value.strip()
+    for key in keys:
+        v = os.environ.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for key in keys:
+        v = file_env.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _pick_int(cli_value: Optional[int], file_env: Dict[str, str], keys: Sequence[str]) -> Optional[int]:
+    if isinstance(cli_value, int):
+        return cli_value
+    raw = _pick_str(None, file_env, keys)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _detect_local_venv_python(root: Path) -> Optional[Path]:
+    candidates = [
+        root / ".venv" / "bin" / "python",
+        root / ".venv" / "Scripts" / "python.exe",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _maybe_reexec_into_venv(root: Path) -> None:
+    venv_python = _detect_local_venv_python(root)
+    if venv_python is None:
+        return
+    try:
+        if Path(sys.executable).resolve() == venv_python.resolve():
+            return
+    except Exception:
+        return
+    try:
+        os.execv(
+            str(venv_python),
+            [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
+    except Exception:
+        return
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _load_state(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_state(path: Path, state: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _try_get_cmdline(pid: int) -> Optional[str]:
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(pid)
+        return " ".join(proc.cmdline())
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        s = out.strip()
+        return s if s else None
+    except Exception:
+        return None
+
+
+def _looks_like_vibes_process(cmdline: str, root: Path) -> bool:
+    bot_path = str((root / "vibes.py").resolve())
+    if bot_path in cmdline:
+        return True
+    if "vibes.py" in cmdline and str(root.resolve()) in cmdline:
+        return True
+    if " -m vibes" in cmdline or cmdline.endswith(" -m vibes") or cmdline.endswith(" -m vibes.py"):
+        return True
+    return False
+
+
+def _format_timedelta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _parse_ps_etime(etime: str) -> Optional[int]:
+    """
+    ps etime formats: [[dd-]hh:]mm:ss
+    """
+    etime = etime.strip()
+    if not etime:
+        return None
+
+    days = 0
+    if "-" in etime:
+        d, rest = etime.split("-", 1)
+        try:
+            days = int(d)
+        except ValueError:
+            return None
+        etime = rest
+
+    parts = etime.split(":")
+    if len(parts) == 2:
+        hh = "0"
+        mm, ss = parts
+    elif len(parts) == 3:
+        hh, mm, ss = parts
+    else:
+        return None
+
+    try:
+        h = int(hh)
+        m = int(mm)
+        s = int(ss)
+    except ValueError:
+        return None
+
+    return (((days * 24) + h) * 60 + m) * 60 + s
+
+
+def cmd_init(root: Path, env_path: Path, *, force: bool) -> int:
+    template = (
+        "# Telegram bot token (required)\n"
+        "VIBES_TOKEN=\n"
+        "\n"
+        "# Your Telegram numeric user_id (optional)\n"
+        "# VIBES_ADMIN_ID=\n"
+        "\n"
+        "# Codex CLI sandbox mode (optional)\n"
+        "# Allowed: read-only | workspace-write | danger-full-access\n"
+        "# VIBES_CODEX_SANDBOX=workspace-write\n"
+        "\n"
+        "# Codex CLI approval policy (optional)\n"
+        "# Allowed: untrusted | on-failure | on-request | never\n"
+        "# VIBES_CODEX_APPROVAL_POLICY=never\n"
+        "\n"
+        "# Optional: python interpreter for the bot\n"
+        f"# VIBES_PYTHON={(root / '.venv' / 'bin' / 'python')}\n"
+    )
+
+    if env_path.exists() and not force:
+        print(f".env уже существует: {env_path}", file=sys.stderr)
+        return 1
+
+    env_path.write_text(template, encoding="utf-8")
+    print(f"Создано: {env_path}")
+    return 0
+
+
+def cmd_start(
+    *,
+    root: Path,
+    env_path: Path,
+    token_cli: Optional[str],
+    admin_cli: Optional[int],
+    python_cli: Optional[str],
+    restart: bool,
+) -> int:
+    runtime_dir = _runtime_dir(root)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    state_path = _state_path(runtime_dir)
+    daemon_log_path = _daemon_log_path(runtime_dir)
+
+    state = _load_state(state_path) or {}
+    existing_pid = state.get("pid")
+    cmdline: Optional[str]
+    looks_like = False
+    if isinstance(existing_pid, int) and _pid_is_running(existing_pid):
+        cmdline = _try_get_cmdline(existing_pid)
+        looks_like = isinstance(cmdline, str) and _looks_like_vibes_process(cmdline, root)
+    else:
+        cmdline = None
+
+    if isinstance(existing_pid, int) and _pid_is_running(existing_pid):
+        if restart:
+            if not looks_like:
+                print(
+                    "Найден запущенный pid, но команда не похожа на vibes-бота — не перезапускаю.",
+                    file=sys.stderr,
+                )
+                return 1
+            stop_result = cmd_stop(root=root, force=False, timeout_s=10.0)
+            if stop_result != 0:
+                return stop_result
+            state = _load_state(state_path) or {}
+            existing_pid = state.get("pid")
+            looks_like = False
+        else:
+            if looks_like:
+                print(f"Уже запущено (pid {existing_pid}).")
+                return 0
+            print(
+                f"Внимание: pid {existing_pid} жив, но не похоже что это vibes-бот.\n"
+                f"Проверь: ps -p {existing_pid} -o command=\n"
+                f"Если это мусорный pidfile, удали: {state_path}",
+                file=sys.stderr,
+            )
+            return 1
+
+    file_env = _parse_env_file(env_path)
+    token = _pick_str(token_cli, file_env, ENV_TOKEN_KEYS)
+    if not token:
+        print(
+            "Не найден токен.\n"
+            f"Создай {env_path} (или запусти `vibes init`) и укажи VIBES_TOKEN=...\n"
+            "Либо передай `vibes start --token ...`",
+            file=sys.stderr,
+        )
+        return 2
+
+    admin_id = _pick_int(admin_cli, file_env, ENV_ADMIN_KEYS)
+    python_bin = _pick_str(python_cli, file_env, ENV_PYTHON_KEYS)
+    if python_bin:
+        python_path = Path(python_bin).expanduser()
+    else:
+        python_path = _detect_local_venv_python(root) or Path(sys.executable)
+
+    bot_script = root / "vibes.py"
+    if not bot_script.exists():
+        print(f"Не найден {bot_script}", file=sys.stderr)
+        return 2
+
+    cmd = [str(python_path), str(bot_script)]
+    env = os.environ.copy()
+    env.update(file_env)
+    env["VIBES_TOKEN"] = token
+    if admin_id is not None:
+        env["VIBES_ADMIN_ID"] = str(admin_id)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    with daemon_log_path.open("a", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(root),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+        )
+
+    _write_state(
+        state_path,
+        {
+            "pid": proc.pid,
+            "started_at": started_at,
+            "cmd": cmd,
+            "cwd": str(root),
+            "env_path": str(env_path),
+            "daemon_log": str(daemon_log_path),
+        },
+    )
+
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        print(f"Не удалось запустить (процесс сразу завершился). Логи: {daemon_log_path}", file=sys.stderr)
+        return 1
+
+    print(f"Запущено (pid {proc.pid}). Логи: {daemon_log_path}")
+    return 0
+
+
+def cmd_status(*, root: Path) -> int:
+    runtime_dir = _runtime_dir(root)
+    state_path = _state_path(runtime_dir)
+    state = _load_state(state_path)
+    if not state:
+        print("Остановлено.")
+        return 3
+
+    pid = state.get("pid")
+    if not isinstance(pid, int):
+        print(f"Некорректный state-файл: {state_path}", file=sys.stderr)
+        return 2
+
+    if not _pid_is_running(pid):
+        print(f"Не запущено (stale pid {pid}).")
+        return 3
+
+    cmdline = _try_get_cmdline(pid)
+
+    # Best-effort resources.
+    rss_mb: Optional[float] = None
+    cpu_pct: Optional[float] = None
+    uptime_s: Optional[float] = None
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(pid)
+        rss_mb = proc.memory_info().rss / (1024 * 1024)
+        try:
+            proc.cpu_percent(interval=None)
+            cpu_pct = proc.cpu_percent(interval=0.05)
+        except Exception:
+            cpu_pct = None
+        try:
+            uptime_s = time.time() - float(proc.create_time())
+        except Exception:
+            uptime_s = None
+    except Exception:
+        pass
+
+    if rss_mb is None and cpu_pct is None and uptime_s is None:
+        try:
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "etime=,%cpu=,rss="],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            fields = out.split()
+            if len(fields) >= 3:
+                uptime_s = _parse_ps_etime(fields[0])
+                try:
+                    cpu_pct = float(fields[1])
+                except ValueError:
+                    cpu_pct = None
+                try:
+                    rss_mb = float(fields[2]) / 1024.0
+                except ValueError:
+                    rss_mb = None
+        except Exception:
+            pass
+
+    parts = [f"Запущено (pid {pid})"]
+    if uptime_s is not None:
+        parts.append(f"uptime {_format_timedelta(uptime_s)}")
+    if cpu_pct is not None:
+        parts.append(f"cpu {cpu_pct:.1f}%")
+    if rss_mb is not None:
+        parts.append(f"rss {rss_mb:.1f}MB")
+
+    print(" · ".join(parts))
+    if cmdline:
+        print(cmdline)
+    daemon_log = state.get("daemon_log")
+    if isinstance(daemon_log, str) and daemon_log:
+        print(f"Логи: {daemon_log}")
+    return 0
+
+
+def cmd_stop(*, root: Path, force: bool, timeout_s: float) -> int:
+    runtime_dir = _runtime_dir(root)
+    state_path = _state_path(runtime_dir)
+    state = _load_state(state_path)
+    if not state:
+        print("Уже остановлено.")
+        return 0
+
+    pid = state.get("pid")
+    if not isinstance(pid, int):
+        print(f"Некорректный state-файл: {state_path}", file=sys.stderr)
+        return 2
+
+    if not _pid_is_running(pid):
+        try:
+            state_path.unlink()
+        except Exception:
+            pass
+        print("Уже остановлено.")
+        return 0
+
+    cmdline = _try_get_cmdline(pid)
+    if cmdline is None and not force:
+        print(
+            "Не могу безопасно проверить что PID принадлежит vibes-боту.\n"
+            f"Проверь вручную: ps -p {pid} -o command=\n"
+            "Или используй `vibes stop --force`.",
+            file=sys.stderr,
+        )
+        return 1
+    if isinstance(cmdline, str) and not _looks_like_vibes_process(cmdline, root) and not force:
+        print(
+            "PID жив, но команда не похожа на vibes-бота — не останавливаю.\n"
+            f"{cmdline}\n"
+            "Если уверен, используй `vibes stop --force`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        print(f"Нет прав остановить pid {pid}: {exc}", file=sys.stderr)
+        return 1
+
+    deadline = time.time() + max(0.0, timeout_s)
+    while time.time() < deadline:
+        if not _pid_is_running(pid):
+            break
+        time.sleep(0.2)
+
+    if _pid_is_running(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    try:
+        state_path.unlink()
+    except Exception:
+        pass
+
+    print("Остановлено.")
+    return 0
+
+
+def _update_env_file(path: Path, updates: Dict[str, Optional[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        existing = []
+
+    keep: list[str] = []
+    for line in existing:
+        stripped = line.strip()
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        if "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in updates:
+                continue
+        keep.append(line)
+
+    for key, value in updates.items():
+        if value is None:
+            continue
+        keep.append(f"{key}={value}")
+
+    content = "\n".join(keep).rstrip() + "\n"
+    path.write_text(content, encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+
+
+def cmd_setup(
+    *,
+    root: Path,
+    env_path: Path,
+    start: bool,
+    restart: bool,
+    python_cli: Optional[str],
+) -> int:
+    file_env = _parse_env_file(env_path)
+
+    token = _pick_str(None, file_env, ENV_TOKEN_KEYS)
+    if not token:
+        token = getpass.getpass("Telegram bot token (VIBES_TOKEN): ").strip()
+    if not token:
+        print("Пустой токен.", file=sys.stderr)
+        return 2
+    if "\n" in token or "\r" in token:
+        print("Токен содержит перевод строки.", file=sys.stderr)
+        return 2
+
+    admin_id = _pick_int(None, file_env, ENV_ADMIN_KEYS)
+    if admin_id is None and sys.stdin.isatty():
+        raw = input("Admin user_id (опционально, Enter чтобы пропустить): ").strip()
+        if raw:
+            try:
+                admin_id = int(raw)
+            except ValueError:
+                print("Admin user_id должен быть числом (или пусто).", file=sys.stderr)
+                return 2
+
+    updates: Dict[str, Optional[str]] = {"VIBES_TOKEN": token}
+    if admin_id is not None:
+        updates["VIBES_ADMIN_ID"] = str(admin_id)
+    _update_env_file(env_path, updates)
+    print(f"Готово: {env_path}")
+
+    if start:
+        return cmd_start(
+            root=root,
+            env_path=env_path,
+            token_cli=None,
+            admin_cli=None,
+            python_cli=python_cli,
+            restart=restart,
+        )
+    return 0
+
+
+def cmd_logs(*, root: Path, follow: bool) -> int:
+    runtime_dir = _runtime_dir(root)
+    state_path = _state_path(runtime_dir)
+    state = _load_state(state_path) or {}
+    daemon_log_raw = state.get("daemon_log")
+    if isinstance(daemon_log_raw, str) and daemon_log_raw.strip():
+        log_path = Path(daemon_log_raw).expanduser()
+    else:
+        log_path = _daemon_log_path(runtime_dir)
+
+    print(str(log_path))
+    if not follow:
+        return 0
+
+    try:
+        from collections import deque
+
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            tail = deque(f, maxlen=200)
+        for line in tail:
+            sys.stdout.write(line)
+        sys.stdout.flush()
+    except FileNotFoundError:
+        print("Файл логов ещё не создан.", file=sys.stderr)
+    except Exception:
+        pass
+
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    continue
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        return 0
+    except FileNotFoundError:
+        return 1
+    except Exception as exc:
+        print(f"Не удалось читать логи: {exc}", file=sys.stderr)
+        return 1
+
+
+def _build_parser() -> tuple[argparse.ArgumentParser, argparse._SubParsersAction]:
+    p = argparse.ArgumentParser(prog="vibes", add_help=True)
+    sub = p.add_subparsers(dest="command")
+
+    p_start = sub.add_parser("start", help="Запустить в фоне")
+    p_start.add_argument("-r", "--restart", action="store_true", help="Остановить и перезапустить, если бот уже работает")
+    p_start.add_argument("--token", default=None, help="Telegram bot token (иначе из .env/env)")
+    p_start.add_argument("--admin", type=int, default=None, help="Telegram user_id (опционально)")
+    p_start.add_argument("--python", default=None, help="Путь до python (иначе .venv или текущий)")
+    p_start.add_argument("--env", dest="env_path", default=None, help="Путь до .env (по умолчанию рядом со скриптом)")
+
+    p_status = sub.add_parser("status", help="Статус")
+
+    p_stop = sub.add_parser("stop", help="Остановить")
+    p_stop.add_argument("--force", action="store_true", help="Остановить без проверки команды процесса")
+    p_stop.add_argument("--timeout", type=float, default=10.0, help="Сколько секунд ждать SIGTERM")
+
+    p_init = sub.add_parser("init", help="Создать .env по шаблону")
+    p_init.add_argument("--force", action="store_true", help="Перезаписать существующий .env")
+    p_init.add_argument("--env", dest="env_path", default=None, help="Путь до .env (по умолчанию рядом со скриптом)")
+
+    p_setup = sub.add_parser("setup", help="Интерактивно создать/обновить .env")
+    p_setup.add_argument("--start", action="store_true", help="Сразу запустить бота")
+    p_setup.add_argument(
+        "-r",
+        "--restart",
+        action="store_true",
+        help="С рестартом (если бот уже работает)",
+    )
+    p_setup.add_argument("--python", default=None, help="Путь до python (иначе .venv или текущий)")
+    p_setup.add_argument("--env", dest="env_path", default=None, help="Путь до .env (по умолчанию рядом со скриптом)")
+
+    p_logs = sub.add_parser("logs", help="Путь к daemon.log")
+    p_logs.add_argument("-f", "--follow", action="store_true", help="Следить за логом (tail -f)")
+
+    p_help = sub.add_parser("help", help="Показать справку")
+    p_help.add_argument("topic", nargs="?", help="Команда (start/status/stop/setup/logs/init)")
+
+    return p, sub
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    root = _repo_root()
+    if argv is None:
+        _maybe_reexec_into_venv(root)
+    parser, sub = _build_parser()
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    if raw_argv and raw_argv[0] == "help":
+        if len(raw_argv) == 1:
+            parser.print_help()
+            return 0
+        topic = raw_argv[1]
+        if topic in sub.choices:
+            sub.choices[topic].print_help()
+            return 0
+        print(f"Неизвестная команда: {topic}", file=sys.stderr)
+        parser.print_help(sys.stderr)
+        return 2
+    if raw_argv and raw_argv[0].startswith("-"):
+        raw_argv = ["start", *raw_argv]
+    ns = parser.parse_args(raw_argv)
+
+    cmd = ns.command or "start"
+
+    env_path = Path(getattr(ns, "env_path", None) or _default_env_path(root)).expanduser()
+
+    if cmd == "init":
+        return cmd_init(root, env_path, force=bool(ns.force))
+    if cmd == "start":
+        return cmd_start(
+            root=root,
+            env_path=env_path,
+            token_cli=getattr(ns, "token", None),
+            admin_cli=getattr(ns, "admin", None),
+            python_cli=getattr(ns, "python", None),
+            restart=bool(getattr(ns, "restart", False)),
+        )
+    if cmd == "status":
+        return cmd_status(root=root)
+    if cmd == "stop":
+        return cmd_stop(root=root, force=bool(ns.force), timeout_s=float(ns.timeout))
+    if cmd == "setup":
+        return cmd_setup(
+            root=root,
+            env_path=env_path,
+            start=bool(ns.start),
+            restart=bool(getattr(ns, "restart", False)),
+            python_cli=getattr(ns, "python", None),
+        )
+    if cmd == "logs":
+        return cmd_logs(root=root, follow=bool(ns.follow))
+    if cmd == "help":
+        topic = getattr(ns, "topic", None)
+        if isinstance(topic, str) and topic.strip():
+            if topic in sub.choices:
+                sub.choices[topic].print_help()
+                return 0
+            print(f"Неизвестная команда: {topic}", file=sys.stderr)
+            parser.print_help(sys.stderr)
+            return 2
+        parser.print_help()
+        return 0
+
+    parser.print_help(sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
