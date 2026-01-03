@@ -24,6 +24,18 @@ class LogParsingTests(unittest.TestCase):
             msg = vibes._extract_last_agent_message_from_stdout_log(str(path), max_chars=200)
             self.assertEqual(msg, "second")
 
+    def test_extract_last_agent_message_from_stdout_log_claude(self) -> None:
+        with TemporaryDirectory() as td:
+            path = Path(td) / "stdout.jsonl"
+            events = [
+                {"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello"}}},
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "Final answer"}]}},
+            ]
+            path.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+
+            msg = vibes._extract_last_agent_message_from_stdout_log(str(path), max_chars=200)
+            self.assertEqual(msg, "Final answer")
+
     def test_preview_from_stdout_log_includes_key_events(self) -> None:
         with TemporaryDirectory() as td:
             path = Path(td) / "stdout.jsonl"
@@ -63,6 +75,19 @@ class LogParsingTests(unittest.TestCase):
             self.assertIn("done", preview)
             self.assertNotIn("SHOULD_NOT_LEAK", preview)
 
+    def test_preview_from_stdout_log_claude_delta(self) -> None:
+        with TemporaryDirectory() as td:
+            path = Path(td) / "stdout.jsonl"
+            events = [
+                {"type": "system", "subtype": "init", "session_id": "abc"},
+                {"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hi"}}},
+                {"type": "result", "result": "Hi"},
+            ]
+            path.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+
+            preview = vibes._preview_from_stdout_log(str(path), max_chars=2000)
+            self.assertIn("Hi", preview)
+
     def test_preview_from_stderr_log_returns_tail(self) -> None:
         with TemporaryDirectory() as td:
             path = Path(td) / "stderr.txt"
@@ -71,4 +96,3 @@ class LogParsingTests(unittest.TestCase):
             preview = vibes._preview_from_stderr_log(str(path), max_chars=5000)
             self.assertIn("line 99", preview)
             self.assertNotIn("line 0", preview)
-

@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -125,7 +126,7 @@ class MkdirFlowTests(unittest.IsolatedAsyncioTestCase):
             panel = _FakePanelUI(fixed_panel_message_id=panel_message_id)
             ctx = _FakeContext(
                 application=_FakeApplication(manager=manager, panel=panel),
-                chat_data={"ui": {"mode": "new_path", "new": {"name": "S"}}},
+                chat_data={"ui": {"mode": "new_path", "new": {"name": "S", "path_mode": "full"}}},
             )
 
             await vibes.on_text(  # type: ignore[arg-type]
@@ -150,6 +151,38 @@ class MkdirFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(missing.is_dir())
             self.assertIn("S", manager.sessions)
             self.assertEqual(ctx.chat_data.get("ui", {}).get("mode"), "session")
+
+    async def test_new_path_simple_name_uses_default_root(self) -> None:
+        with TemporaryDirectory() as td:
+            base = Path(td) / "Documents"
+            chat_id = 1
+            panel_message_id = 10
+
+            manager = vibes.SessionManager(admin_id=1)
+            manager.panel_by_chat = {chat_id: panel_message_id}
+            panel = _FakePanelUI(fixed_panel_message_id=panel_message_id)
+            ctx = _FakeContext(
+                application=_FakeApplication(manager=manager, panel=panel),
+                chat_data={"ui": {"mode": "new_path", "new": {"name": "S", "path_mode": "docs"}}},
+            )
+
+            old_env = os.environ.get("VIBES_DEFAULT_PROJECTS_DIR")
+            os.environ["VIBES_DEFAULT_PROJECTS_DIR"] = str(base)
+            try:
+                await vibes.on_text(  # type: ignore[arg-type]
+                    _FakeTextUpdate(chat_id=chat_id, user_id=1, text="demo"),
+                    ctx,
+                )
+            finally:
+                if old_env is None:
+                    os.environ.pop("VIBES_DEFAULT_PROJECTS_DIR", None)
+                else:
+                    os.environ["VIBES_DEFAULT_PROJECTS_DIR"] = old_env
+
+            ui = ctx.chat_data.get("ui", {})
+            expected = (base / "demo").resolve()
+            self.assertEqual(ui.get("mode"), "confirm_mkdir")
+            self.assertEqual(ui.get("mkdir", {}).get("path"), str(expected))
 
     async def test_paths_add_missing_dir_offers_create_and_adds_preset(self) -> None:
         with TemporaryDirectory() as td:
@@ -212,4 +245,3 @@ class MkdirFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn((chat_id, ack_message_id), panel.deletes)
-

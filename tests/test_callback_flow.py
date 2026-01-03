@@ -165,7 +165,7 @@ class CallbackFlowTests(unittest.IsolatedAsyncioTestCase):
             await vibes.on_callback(update_new, ctx)  # type: ignore[arg-type]
             self.assertEqual(ctx.chat_data.get("ui", {}).get("mode"), "new_name")
             self.assertTrue(panel.renders)
-            self.assertIn("Step 1/2", panel.renders[-1][2])
+            self.assertIn("Step 1/3", panel.renders[-1][2])
 
             # 2) Pick auto name
             update_auto = _FakeUpdate(
@@ -174,11 +174,33 @@ class CallbackFlowTests(unittest.IsolatedAsyncioTestCase):
                 query=_FakeCallbackQuery(data=vibes._cb("new_auto"), message_id=panel_message_id),
             )
             await vibes.on_callback(update_auto, ctx)  # type: ignore[arg-type]
-            self.assertEqual(ctx.chat_data.get("ui", {}).get("mode"), "new_path")
+            self.assertEqual(ctx.chat_data.get("ui", {}).get("mode"), "new_engine")
             draft = ctx.chat_data["ui"]["new"]
             self.assertIn("name", draft)
 
-            # 3) Pick path preset -> session created
+            # 3) Pick engine
+            update_engine = _FakeUpdate(
+                chat_id=chat_id,
+                user_id=1,
+                query=_FakeCallbackQuery(data=vibes._cb("engine", "codex"), message_id=panel_message_id),
+            )
+            await vibes.on_callback(update_engine, ctx)  # type: ignore[arg-type]
+            self.assertEqual(ctx.chat_data.get("ui", {}).get("mode"), "new_path")
+            draft = ctx.chat_data["ui"]["new"]
+            self.assertEqual(draft.get("engine"), "codex")
+
+            # 4) Pick path mode
+            update_mode = _FakeUpdate(
+                chat_id=chat_id,
+                user_id=1,
+                query=_FakeCallbackQuery(data=vibes._cb("path_mode", "full"), message_id=panel_message_id),
+            )
+            await vibes.on_callback(update_mode, ctx)  # type: ignore[arg-type]
+            self.assertEqual(ctx.chat_data.get("ui", {}).get("mode"), "new_path")
+            draft = ctx.chat_data["ui"]["new"]
+            self.assertEqual(draft.get("path_mode"), "full")
+
+            # 5) Pick path preset -> session created
             update_pick = _FakeUpdate(
                 chat_id=chat_id,
                 user_id=1,

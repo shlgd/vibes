@@ -112,6 +112,13 @@ DEFAULT_REASONING_EFFORT = "high"
 CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 CODEX_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
 
+ENGINE_CODEX = "codex"
+ENGINE_CLAUDE = "claude"
+ENGINE_CHOICES = {ENGINE_CODEX, ENGINE_CLAUDE}
+
+DEFAULT_CLAUDE_MODEL = "sonnet"
+DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
+
 
 def _env_flag(name: str) -> bool:
     raw = os.environ.get(name, "").strip().lower()
@@ -190,6 +197,16 @@ def _codex_approval_policy() -> str:
     if raw in CODEX_APPROVAL_POLICIES:
         return raw
     return "never"
+
+
+def _claude_permission_mode() -> str:
+    raw = os.environ.get("VIBES_CLAUDE_PERMISSION_MODE", "").strip()
+    return raw or DEFAULT_CLAUDE_PERMISSION_MODE
+
+
+def _claude_model_default() -> str:
+    raw = os.environ.get("VIBES_CLAUDE_MODEL", "").strip()
+    return raw or DEFAULT_CLAUDE_MODEL
 
 
 def _detect_git_dir(path: Path) -> Optional[Path]:
@@ -312,6 +329,48 @@ def _safe_resolve_path(raw: str) -> Tuple[Optional[Path], str]:
         return p.resolve(), ""
     except Exception as e:
         return None, f"Failed to resolve path: {raw_s!r} ({e})"
+
+
+def _pretty_path(path: Path) -> str:
+    try:
+        p = path.expanduser().resolve()
+        home = Path.home().expanduser().resolve()
+        if p == home:
+            return "~"
+        if home in p.parents:
+            return f"~/{p.relative_to(home)}"
+        return str(p)
+    except Exception:
+        return str(path)
+
+
+def _default_projects_root() -> Path:
+    raw = os.environ.get("VIBES_DEFAULT_PROJECTS_DIR", "").strip()
+    if raw:
+        try:
+            p = Path(raw).expanduser()
+        except Exception:
+            return (Path.home() / "Documents").expanduser()
+        try:
+            return p.resolve()
+        except Exception:
+            return p
+    return (Path.home() / "Documents").expanduser()
+
+
+def _is_simple_folder_name(text: str) -> bool:
+    s = (text or "").strip()
+    if not s or s in {".", ".."}:
+        return False
+    if "\x00" in s:
+        return False
+    if "/" in s or "\\" in s:
+        return False
+    if s.startswith("~"):
+        return False
+    if re.match(r"^[a-zA-Z]:", s):
+        return False
+    return True
 
 
 def _max_attachment_bytes() -> Optional[int]:
@@ -487,6 +546,13 @@ async def _download_attachments_to_session_root(
         skipped_view = ", ".join(skipped[:6])
         more = f" (+{len(skipped) - 6} more)" if len(skipped) > 6 else ""
         notice = f"Attachment too large (limit: {lim_mb:.0f} MB). Skipped: {skipped_view}{more}"
+
+    if saved:
+        saved_view = ", ".join(saved[:6])
+        more = f" (+{len(saved) - 6} more)" if len(saved) > 6 else ""
+        _log_line(f"attachments_saved dir={session_root} files={saved_view}{more}")
+    if notice:
+        _log_line(f"attachments_skipped dir={session_root} reason={notice}")
 
     return saved, notice
 
@@ -780,6 +846,59 @@ def _extract_text_delta(obj: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _extract_claude_session_id(obj: Dict[str, Any]) -> Optional[str]:
+    if obj.get("type") != "system" or obj.get("subtype") != "init":
+        return None
+    session_id = obj.get("session_id")
+    return session_id if isinstance(session_id, str) and session_id.strip() else None
+
+
+def _extract_claude_text_delta(obj: Dict[str, Any]) -> Optional[str]:
+    if obj.get("type") != "stream_event":
+        return None
+    event = obj.get("event")
+    if not isinstance(event, dict):
+        return None
+    if event.get("type") != "content_block_delta":
+        return None
+    delta = event.get("delta")
+    if not isinstance(delta, dict):
+        return None
+    if delta.get("type") != "text_delta":
+        return None
+    text = delta.get("text")
+    return text if isinstance(text, str) and text else None
+
+
+def _extract_claude_assistant_text(obj: Dict[str, Any]) -> Optional[str]:
+    if obj.get("type") != "assistant":
+        return None
+    message = obj.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    parts: List[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    if not parts:
+        return None
+    return "".join(parts)
+
+
+def _extract_claude_result_text(obj: Dict[str, Any]) -> Optional[str]:
+    if obj.get("type") != "result":
+        return None
+    result = obj.get("result")
+    return result if isinstance(result, str) and result.strip() else None
+
+
 def _extract_item(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     item = obj.get("item")
     if isinstance(item, dict):
@@ -903,6 +1022,9 @@ def _extract_last_agent_message_from_stdout_log(path: Optional[str], *, max_char
             continue
         if not isinstance(obj, dict):
             continue
+        claude_text = _extract_claude_assistant_text(obj) or _extract_claude_result_text(obj)
+        if claude_text:
+            return _truncate_text(claude_text.strip(), max_chars)
         event_type = _get_event_type(obj)
         if event_type in {"agent_message", "assistant_message"}:
             text = obj.get("text")
@@ -929,6 +1051,7 @@ def _preview_from_stdout_log(path: Optional[str], *, max_chars: int = UI_PREVIEW
 
     pieces: List[str] = []
     last_cmd: Optional[str] = None
+    saw_claude_delta = False
     for line in raw.splitlines()[-250:]:
         s = line.strip()
         if not s:
@@ -941,6 +1064,22 @@ def _preview_from_stdout_log(path: Optional[str], *, max_chars: int = UI_PREVIEW
         if not isinstance(obj, dict):
             pieces.append(line)
             continue
+
+        delta = _extract_claude_text_delta(obj)
+        if delta:
+            pieces.append(delta)
+            saw_claude_delta = True
+            continue
+
+        if not saw_claude_delta:
+            claude_msg = _extract_claude_assistant_text(obj)
+            if claude_msg:
+                pieces.append("\n" + claude_msg + "\n")
+                continue
+            claude_result = _extract_claude_result_text(obj)
+            if claude_result:
+                pieces.append("\n" + claude_result + "\n")
+                continue
 
         event_type = _get_event_type(obj)
         if event_type.startswith("item."):
@@ -1368,6 +1507,7 @@ class SessionRun:
 class SessionRecord:
     name: str
     path: str
+    engine: str = ENGINE_CODEX
     thread_id: Optional[str] = None
     model: str = DEFAULT_MODEL
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
@@ -1483,15 +1623,22 @@ class SessionManager:
                 path = payload.get("path")
                 if not isinstance(path, str) or not path:
                     continue
+                engine_val = payload.get("engine")
+                if not isinstance(engine_val, str) or engine_val not in ENGINE_CHOICES:
+                    engine_val = ENGINE_CODEX
+                model_val = payload.get("model")
+                if not isinstance(model_val, str) or not model_val:
+                    model_val = _claude_model_default() if engine_val == ENGINE_CLAUDE else DEFAULT_MODEL
                 rec = SessionRecord(
                     name=safe_name,
                     path=path,
+                    engine=engine_val,
                     thread_id=payload.get("thread_id")
                     if isinstance(payload.get("thread_id"), str)
                     else payload.get("session_id")
                     if isinstance(payload.get("session_id"), str)
                     else None,
-                    model=payload.get("model") if isinstance(payload.get("model"), str) and payload.get("model") else DEFAULT_MODEL,
+                    model=model_val,
                     reasoning_effort=(
                         payload.get("reasoning_effort")
                         if isinstance(payload.get("reasoning_effort"), str) and payload.get("reasoning_effort")
@@ -1563,6 +1710,7 @@ class SessionManager:
             for name, rec in self.sessions.items():
                 payload["sessions"][name] = {
                     "path": rec.path,
+                    "engine": rec.engine,
                     "thread_id": rec.thread_id,
                     "model": rec.model,
                     "reasoning_effort": rec.reasoning_effort,
@@ -1620,10 +1768,22 @@ class SessionManager:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
         await self.save_state()
 
-    async def create_session(self, *, name: str, path: str) -> Tuple[Optional[SessionRecord], str]:
+    async def create_session(
+        self,
+        *,
+        name: str,
+        path: str,
+        engine: Optional[str] = None,
+    ) -> Tuple[Optional[SessionRecord], str]:
         safe_name = _safe_session_name(name)
         if not safe_name:
             return None, "Invalid name. Allowed: a-zA-Z0-9._- (<=64)."
+
+        engine_val = engine.strip() if isinstance(engine, str) else ""
+        if not engine_val:
+            engine_val = ENGINE_CODEX
+        if engine_val not in ENGINE_CHOICES:
+            return None, f"Invalid engine: {engine_val}"
 
         resolved, err = _safe_resolve_path(path)
         if err:
@@ -1636,9 +1796,18 @@ class SessionManager:
         if safe_name in self.sessions:
             return None, f"Session '{safe_name}' already exists."
 
-        rec = SessionRecord(name=safe_name, path=abs_path, status="idle", last_result="never")
+        model_val = _claude_model_default() if engine_val == ENGINE_CLAUDE else DEFAULT_MODEL
+        rec = SessionRecord(
+            name=safe_name,
+            path=abs_path,
+            engine=engine_val,
+            model=model_val,
+            status="idle",
+            last_result="never",
+        )
         self.sessions[safe_name] = rec
         await self.save_state()
+        _log_line(f"session_created name={safe_name} engine={engine_val} path={abs_path}")
         return rec, ""
 
     async def delete_session(self, name: str) -> Tuple[bool, str]:
@@ -1649,6 +1818,7 @@ class SessionManager:
         if rec.run and rec.run.process.returncode is None:
             rec.pending_delete = True
             await self.save_state()
+            _log_line(f"session_delete_requested name={rec.name} engine={rec.engine}")
             await self.stop(name)
             return True, "Stop requested. Session will be deleted after it finishes."
 
@@ -1656,6 +1826,7 @@ class SessionManager:
         del self.sessions[name]
 
         await self.save_state()
+        _log_line(f"session_deleted name={rec.name} engine={rec.engine}")
         return True, "Deleted."
 
     async def clear_session_state(self, name: str) -> Tuple[bool, str]:
@@ -1677,6 +1848,7 @@ class SessionManager:
         rec.run = None
 
         await self.save_state()
+        _log_line(f"session_cleared name={rec.name} engine={rec.engine}")
         return True, "Cleared."
 
     def _delete_session_artifacts(self, rec: SessionRecord) -> None:
@@ -1758,12 +1930,32 @@ class SessionManager:
         except Exception as e:
             _log_error("pause_other_attached_runs failed.", e)
 
-        self.register_run_message(chat_id=chat_id, message_id=panel_message_id, session_name=rec.name)
+        engine = rec.engine if rec.engine in ENGINE_CHOICES else ENGINE_CODEX
+        if engine == ENGINE_CLAUDE:
+            cmd = self._build_claude_cmd(rec, prompt=prompt, run_mode=run_mode)
+        else:
+            cmd = self._build_codex_cmd(rec, prompt=prompt, run_mode=run_mode)
+        run_cwd = rec.path if engine == ENGINE_CLAUDE else None
+        _log_line(f"run_start session={rec.name} engine={engine} mode={run_mode} path={rec.path}")
+
+        output_message_id = panel_message_id
+        try:
+            msg = await application.bot.send_message(
+                chat_id=chat_id,
+                text=f"<i>{_h(RUN_START_WAIT_NOTE)}</i>",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            output_message_id = msg.message_id
+        except Exception as e:
+            _log_error("Failed to create output message; falling back to panel.", e)
+
+        self.register_run_message(chat_id=chat_id, message_id=output_message_id, session_name=rec.name)
 
         stream = TelegramStream(
             application,
             chat_id=chat_id,
-            message_id=panel_message_id,
+            message_id=output_message_id,
             header_html=f"<i>{_h(RUN_START_WAIT_NOTE)}</i>",
             header_plain_len=len(RUN_START_WAIT_NOTE),
             auto_clear_header_on_first_log=True,
@@ -1772,8 +1964,6 @@ class SessionManager:
             wrap_log_in_pre=True,
             reply_markup=running_kb,
         )
-
-        cmd = self._build_codex_cmd(rec, prompt=prompt, run_mode=run_mode)
 
         async def _handle_start_failure(*, stderr_text: str) -> None:
             try:
@@ -1802,12 +1992,14 @@ class SessionManager:
                 _log_error("Failed to render start failure panel.", e)
 
         try:
-            process = await self._spawn_process(cmd)
+            process = await self._spawn_process(cmd, cwd=run_cwd)
         except FileNotFoundError:
-            await _handle_start_failure(stderr_text="`codex` not found in PATH.\n")
+            missing = "`claude`" if engine == ENGINE_CLAUDE else "`codex`"
+            await _handle_start_failure(stderr_text=f"{missing} not found in PATH.\n")
             return
         except Exception as e:
-            await _handle_start_failure(stderr_text=f"Failed to start Codex: {e}\n")
+            name = "Claude" if engine == ENGINE_CLAUDE else "Codex"
+            await _handle_start_failure(stderr_text=f"Failed to start {name}: {e}\n")
             return
 
         stderr_tail: Deque[str] = deque(maxlen=STDERR_TAIL_LINES)
@@ -1825,6 +2017,9 @@ class SessionManager:
             started_mono=started_mono,
         )
         await self.save_state()
+        pid_val = getattr(process, "pid", None)
+        pid_label = str(pid_val) if isinstance(pid_val, int) else "unknown"
+        _log_line(f"run_spawned session={rec.name} engine={engine} pid={pid_label}")
 
         return_code = await process.wait()
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
@@ -1848,6 +2043,9 @@ class SessionManager:
 
         rec.run = None
         await self.save_state()
+        _log_line(
+            f"run_finished session={rec.name} engine={engine} code={return_code} status={rec.status} duration_s={rec.last_run_duration_s}"
+        )
 
         if not paused:
             try:
@@ -1863,16 +2061,7 @@ class SessionManager:
             except Exception:
                 pass
 
-        try:
-            await self._send_completion_notice(
-                application=application,
-                chat_id=chat_id,
-                session_name=rec.name,
-                path=rec.path,
-                prompt=prompt,
-            )
-        except Exception as e:
-            _log_error("Failed to send completion notice.", e)
+        # Completion notice removed; info is available via the menu button.
 
         if rec.pending_delete:
             await self.delete_session(rec.name)
@@ -1978,6 +2167,7 @@ class SessionManager:
             return False
         run = rec.run
         run.stop_requested = True
+        _log_line(f"run_stop_requested session={rec.name} engine={rec.engine} reason={reason}")
 
         proc = run.process
         if proc.returncode is not None:
@@ -2041,11 +2231,38 @@ class SessionManager:
             base.append(prompt_s)
         return base
 
-    async def _spawn_process(self, cmd: List[str]) -> asyncio.subprocess.Process:
+    def _build_claude_cmd(self, rec: SessionRecord, *, prompt: str, run_mode: str) -> List[str]:
+        permission_mode = _claude_permission_mode()
+        model = rec.model or _claude_model_default()
+        base = [
+            "claude",
+            "-p",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--permission-mode",
+            permission_mode,
+            "--model",
+            model,
+        ]
+
+        prompt_s = prompt or ""
+        needs_end_of_opts = bool(prompt_s.lstrip().startswith("-"))
+        if run_mode == "continue" and rec.thread_id:
+            base += ["-r", rec.thread_id]
+        if needs_end_of_opts:
+            base.append("--")
+        base.append(prompt_s)
+        return base
+
+    async def _spawn_process(self, cmd: List[str], *, cwd: Optional[str] = None) -> asyncio.subprocess.Process:
         kwargs: Dict[str, Any] = {
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
         }
+        if cwd:
+            kwargs["cwd"] = cwd
         if os.name == "posix":
             kwargs["start_new_session"] = True
         else:
@@ -2128,7 +2345,10 @@ class SessionManager:
                         await stream.add_text(decoded)
                         continue
 
-                    await self._handle_json_event(rec=rec, obj=obj, stream=stream)
+                    if rec.engine == ENGINE_CLAUDE:
+                        await self._handle_claude_json_event(rec=rec, obj=obj, stream=stream)
+                    else:
+                        await self._handle_json_event(rec=rec, obj=obj, stream=stream)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -2216,6 +2436,7 @@ class SessionManager:
                 rec.thread_id = explicit_id
                 rec.last_active = _utc_now_iso()
                 await self.save_state()
+                _log_line(f"thread_id_set session={rec.name} engine={rec.engine} thread_id={explicit_id}")
 
         if event_type in ("thread.started", "thread_started", "thread.start"):
             # На всякий случай: некоторые форматы могут не иметь session_id/thread_id в ожидаемых полях.
@@ -2224,6 +2445,7 @@ class SessionManager:
                 rec.thread_id = session_id
                 rec.last_active = _utc_now_iso()
                 await self.save_state()
+                _log_line(f"thread_id_set session={rec.name} engine={rec.engine} thread_id={session_id}")
             return
 
         if event_type.startswith("item."):
@@ -2296,6 +2518,19 @@ class SessionManager:
 
         # Мягкий фоллбек: если видим текст — показываем, иначе игнорируем.
         delta = _extract_text_delta(obj)
+        if delta:
+            await stream.add_text(delta)
+            return
+
+    async def _handle_claude_json_event(self, *, rec: SessionRecord, obj: Dict[str, Any], stream: TelegramStream) -> None:
+        session_id = _extract_claude_session_id(obj)
+        if session_id and session_id != rec.thread_id:
+            rec.thread_id = session_id
+            rec.last_active = _utc_now_iso()
+            await self.save_state()
+            _log_line(f"thread_id_set session={rec.name} engine={rec.engine} thread_id={session_id}")
+
+        delta = _extract_claude_text_delta(obj)
         if delta:
             await stream.add_text(delta)
             return
@@ -2533,7 +2768,7 @@ def _ui_sanitize(manager: "SessionManager", chat_data: Dict[str, Any]) -> None:
     ui = _ui_get(chat_data)
     mode = ui.get("mode") if isinstance(ui.get("mode"), str) else "sessions"
     session_name = ui.get("session") if isinstance(ui.get("session"), str) else None
-    if mode in {"session", "logs", "model", "model_custom", "confirm_delete", "confirm_stop", "await_prompt"}:
+    if mode in {"session", "logs", "model", "model_custom", "confirm_delete", "confirm_stop", "await_prompt", "info"}:
         if not session_name or session_name not in manager.sessions:
             _ui_set(chat_data, mode="sessions")
 
@@ -2544,10 +2779,12 @@ def _build_running_header_plain(rec: SessionRecord, *, note: Optional[str] = Non
     lines = [
         f"Session: {rec.name}",
         f"Path: {rec.path}",
+        f"Engine: {rec.engine}",
         f"Model: {model}",
-        f"Reasoning effort: {reasoning_effort}",
-        f"Status: {rec.status}",
     ]
+    if rec.engine == ENGINE_CODEX:
+        lines.append(f"Reasoning effort: {reasoning_effort}")
+    lines.append(f"Status: {rec.status}")
     if note:
         lines.append(note)
     return "\n".join(lines)
@@ -2561,11 +2798,17 @@ def _build_running_header_html(rec: SessionRecord, *, note: Optional[str] = None
     model = rec.model
     reasoning_effort = rec.reasoning_effort
     note_line = f"\n<i>{_h(note)}</i>" if note else ""
+    reasoning_line = (
+        f"\n<b>Reasoning effort:</b> <code>{_h(reasoning_effort)}</code>"
+        if rec.engine == ENGINE_CODEX
+        else ""
+    )
     return (
         f"<b>Session:</b> <code>{_h(rec.name)}</code>\n"
         f"<b>Path:</b> <code>{_h(rec.path)}</code>\n"
+        f"<b>Engine:</b> <code>{_h(rec.engine)}</code>\n"
         f"<b>Model:</b> <code>{_h(model)}</code>\n"
-        f"<b>Reasoning effort:</b> <code>{_h(reasoning_effort)}</code>\n"
+        f"{reasoning_line}\n"
         f"<b>Status:</b> {_h(rec.status)}"
         f"{note_line}"
     )
@@ -2756,7 +2999,7 @@ def _render_sessions_list(
     rows.append([InlineKeyboardButton("🔄", callback_data=_cb("restart"))])
     text_html = (
         f"{notice_html}"
-        "<b>Vibes</b> is a lightweight session manager for Codex CLI.\n\n"
+        "<b>Vibes</b> is a lightweight session manager for Codex CLI and Claude Code.\n\n"
         "Choose or create session:"
     )
     return text_html, InlineKeyboardMarkup(rows)
@@ -2768,13 +3011,35 @@ def _render_new_name(manager: SessionManager, *, chat_data: Dict[str, Any], noti
     notice_html = f"<i>{_h(notice)}</i>\n\n" if notice else ""
     text_html = (
         f"{notice_html}"
-        "<b>Step 1/2 — Name</b>\n\n"
+        "<b>Step 1/3 — Name</b>\n\n"
         "Send a session name: <code>a-zA-Z0-9._-</code>.\n"
         "Or tap the suggested name below."
     )
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(f"{auto_name}", callback_data=_cb("new_auto"))],
+            [InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back"))],
+        ]
+    )
+    return text_html, kb
+
+
+def _render_new_engine(*, chat_data: Dict[str, Any], notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
+    ui = _ui_get(chat_data)
+    draft = ui.get("new")
+    name = draft.get("name") if isinstance(draft, dict) else None
+    notice_html = f"<i>{_h(notice)}</i>\n\n" if notice else ""
+    name_line = f"Session: <code>{_h(name)}</code>\n\n" if isinstance(name, str) and name else ""
+    text_html = (
+        f"{notice_html}"
+        "<b>Step 2/3 — Engine</b>\n\n"
+        f"{name_line}"
+        "Pick the CLI engine for this session."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Codex CLI", callback_data=_cb("engine", ENGINE_CODEX))],
+            [InlineKeyboardButton("Claude Code", callback_data=_cb("engine", ENGINE_CLAUDE))],
             [InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back"))],
         ]
     )
@@ -2791,24 +3056,68 @@ def _render_new_path(
     ui = _ui_get(chat_data)
     draft = ui.get("new")
     name = draft.get("name") if isinstance(draft, dict) else None
+    engine = draft.get("engine") if isinstance(draft, dict) else None
+    path_mode = draft.get("path_mode") if isinstance(draft, dict) else None
 
     notice_html = f"<i>{_h(notice)}</i>\n\n" if notice else ""
     notice_code_html = f"<b>Путь:</b> <code>{_h(notice_code)}</code>\n\n" if notice_code else ""
+    docs_root = _default_projects_root()
+    docs_label = _pretty_path(docs_root)
+    engine_line = f"Engine: <code>{_h(engine)}</code>\n\n" if isinstance(engine, str) and engine else ""
+
+    if path_mode not in {"docs", "full"}:
+        text_html = (
+            f"{notice_html}"
+            "<b>Step 3/3 — Где работать?</b>\n\n"
+            f"{engine_line}"
+            "Выбери вариант ниже.\n\n"
+            f"<b>Documents:</b> <code>{_h(docs_label)}</code>\n"
+            "• <i>Создать в Documents</i> — ты пишешь только имя папки.\n"
+            "• <i>Полный путь</i> — ты указываешь директорию целиком."
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📁 Создать в Documents", callback_data=_cb("path_mode", "docs"))],
+                [InlineKeyboardButton("🧭 Указать полный путь", callback_data=_cb("path_mode", "full"))],
+                [InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back"))],
+            ]
+        )
+        return text_html, kb
+
+    if path_mode == "docs":
+        text_html = (
+            f"{notice_html}"
+            "<b>Step 3/3 — Имя папки</b>\n\n"
+            f"{engine_line}"
+            f"Будем работать в: <code>{_h(docs_label)}</code>\n\n"
+            "Напиши <b>название папки</b> (например: <code>my-project</code>).\n"
+            "Папка будет создана в Documents."
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("← Выбор места", callback_data=_cb("path_mode", "reset"))],
+                [InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back"))],
+            ]
+        )
+        return text_html, kb
+
+    # path_mode == "full"
     text_html = (
         f"{notice_html}"
-        "<b>Step 2/2 — Path</b>\n\n"
+        "<b>Step 3/3 — Полный путь</b>\n\n"
         f"{notice_code_html}"
-        "Send a directory path, or choose a preset below.\n\n"
-        "<i>Tip: you can use <code>~/</code> as your home directory.</i>\n"
-        "<i>For example: <code>~/projects/my-app</code></i>\n\n"
-        "<b>Click on path to copy!</b>"
+        f"{engine_line}"
+        "Укажи полный путь к директории (или выбери пресет ниже).\n\n"
+        "<i>Подсказка: можно использовать <code>~/</code> как домашнюю папку.</i>\n"
+        "<i>Пример: <code>~/projects/my-app</code></i>\n\n"
+        "<b>Нажми на путь, чтобы скопировать.</b>"
     )
 
     rows: List[List[InlineKeyboardButton]] = []
     for i, p in enumerate(manager.path_presets):
         rows.append([InlineKeyboardButton(f"📁 {_shorten_path(p)}", callback_data=_cb("path_pick", str(i)))])
-
-    rows.append([InlineKeyboardButton("⚙️", callback_data=_cb("paths"))])
+    rows.append([InlineKeyboardButton("⚙️ Пресеты", callback_data=_cb("paths"))])
+    rows.append([InlineKeyboardButton("← Выбор места", callback_data=_cb("path_mode", "reset"))])
     rows.append([InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back"))])
     return text_html, InlineKeyboardMarkup(rows)
 
@@ -2927,19 +3236,34 @@ def _render_confirm_stop(session_name: str, *, notice: Optional[str] = None) -> 
 def _render_session_compact_info(rec: SessionRecord) -> str:
     model = rec.model
     reasoning_effort = rec.reasoning_effort
-    return f"<code>{_h(model)}</code> <code>{_h(reasoning_effort)}</code>\n<code>{_h(rec.path)}</code>"
+    if rec.engine == ENGINE_CLAUDE:
+        return f"<code>{_h(rec.engine)}</code> <code>{_h(model)}</code>\n<code>{_h(rec.path)}</code>"
+    return f"<code>{_h(rec.engine)}</code> <code>{_h(model)}</code> <code>{_h(reasoning_effort)}</code>\n<code>{_h(rec.path)}</code>"
 
 
 def _render_model(rec: SessionRecord, *, notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
     current = rec.model
     reasoning_effort = rec.reasoning_effort
     notice_html = f"<i>{_h(notice)}</i>\n\n" if notice else ""
+    engine_line = f"Engine: <code>{_h(rec.engine)}</code>"
     lines = [
         f"{notice_html}<b>Run settings</b>",
         "",
         _render_session_compact_info(rec),
         "",
+        engine_line,
         f"Model: <code>{_h(current)}</code>",
+    ]
+
+    if rec.engine == ENGINE_CLAUDE:
+        lines += ["", "Claude uses model ids; use 📝 to set a custom model."]
+        rows: List[List[InlineKeyboardButton]] = [
+            [InlineKeyboardButton("📝", callback_data=_cb("model_custom"))],
+            [InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back"))],
+        ]
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+    lines += [
         f"Reasoning effort: <code>{_h(reasoning_effort)}</code>",
         "",
         "Pick overrides below.",
@@ -2981,7 +3305,10 @@ def _render_model(rec: SessionRecord, *, notice: Optional[str] = None) -> Tuple[
 
 def _render_model_custom(rec: SessionRecord, *, notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
     notice_html = f"<i>{_h(notice)}</i>\n\n" if notice else ""
-    example = MODEL_PRESETS[0] if MODEL_PRESETS else "o3"
+    if rec.engine == ENGINE_CLAUDE:
+        example = _claude_model_default()
+    else:
+        example = MODEL_PRESETS[0] if MODEL_PRESETS else "o3"
     text_html = (
         f"{notice_html}"
         "<b>Custom model</b>\n\n"
@@ -2998,26 +3325,62 @@ def _render_await_prompt(
     run_mode: str,
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    engine: Optional[str] = None,
     path: Optional[str] = None,
     notice: Optional[str] = None,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     mode_label = "continue (resume)" if run_mode == "continue" else "new prompt"
     notice_html = f"<i>{_h(notice)}</i>\n\n" if notice else ""
-    model_label = model or DEFAULT_MODEL
+    engine_label = engine or ENGINE_CODEX
+    model_label = model or (_claude_model_default() if engine_label == ENGINE_CLAUDE else DEFAULT_MODEL)
     reasoning_label = reasoning_effort or DEFAULT_REASONING_EFFORT
     path_label = path or ""
     path_line = f"<code>{_h(path_label)}</code>\n" if path_label else ""
+    engine_line = f"<code>{_h(engine_label)}</code>\n"
+    reasoning_line = (
+        f"<code>{_h(reasoning_label)}</code>\n" if engine_label == ENGINE_CODEX else ""
+    )
     text_html = (
         f"{notice_html}"
         f"<b>Session:</b> <code>{_h(session_name)}</code>\n"
-        f"<code>{_h(model_label)}</code> <code>{_h(reasoning_label)}</code>\n"
+        f"{engine_line}"
+        f"<code>{_h(model_label)}</code>\n"
+        f"{reasoning_line}"
         f"{path_line}\n"
         "Напиши промт сообщением.\n\n"
         f"<i>Режим:</i> {_h(mode_label)}"
     )
     kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⚙️", callback_data=_cb("model")), InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back"))]]
+        [
+            [
+                InlineKeyboardButton("⚙️", callback_data=_cb("model")),
+                InlineKeyboardButton("ℹ️", callback_data=_cb("info")),
+            ],
+            [InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back"))],
+        ]
     )
+    return text_html, kb
+
+
+def _render_info(rec: SessionRecord, *, notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
+    notice_html = f"<i>{_h(notice)}</i>\n\n" if notice else ""
+    duration = _format_duration(rec.last_run_duration_s or 0) if rec.last_run_duration_s else "—"
+    reasoning_line = (
+        f"Reasoning effort: <code>{_h(rec.reasoning_effort)}</code>\n" if rec.engine == ENGINE_CODEX else ""
+    )
+    text_html = (
+        f"{notice_html}"
+        "<b>Session info</b>\n\n"
+        f"Name: <code>{_h(rec.name)}</code>\n"
+        f"Engine: <code>{_h(rec.engine)}</code>\n"
+        f"Model: <code>{_h(rec.model)}</code>\n"
+        f"{reasoning_line}"
+        f"Status: <code>{_h(rec.status)}</code>\n"
+        f"Last result: <code>{_h(rec.last_result)}</code>\n"
+        f"Last run: <code>{_h(duration)}</code>\n"
+        f"Path: <code>{_h(rec.path)}</code>"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back"))]])
     return text_html, kb
 
 
@@ -3038,14 +3401,12 @@ def _render_session_view(
     compact_info = _render_session_compact_info(rec)
 
     if _is_running(rec) and rec.run:
-        raw = _preview_from_stdout_log(rec.last_stdout_log, max_chars=100000).strip()
-        log_tail = _tail_text(raw, 3200) if raw else ""
-        start_note_html = f"<i>{_h(RUN_START_WAIT_NOTE)}</i>\n\n" if not log_tail else ""
         elapsed_s = int(time.monotonic() - rec.run.started_mono)
         text_html = (
             f"{notice_html}"
-            f"{start_note_html}"
-            f"<pre><code>{_h(log_tail)}</code></pre>\n\n"
+            f"<b>Running…</b>\n\n"
+            f"{_render_session_compact_info(rec)}\n\n"
+            "Вывод идёт отдельным сообщением ниже.\n\n"
             f"<code>---- Working {_h(_format_duration(elapsed_s))} ----</code>"
         )
         kb = InlineKeyboardMarkup(
@@ -3053,7 +3414,8 @@ def _render_session_view(
                 [
                     InlineKeyboardButton("⬅️", callback_data=_cb("back_sessions")),
                     InlineKeyboardButton("⛔", callback_data=_cb("interrupt")),
-                ]
+                ],
+                [InlineKeyboardButton("ℹ️", callback_data=_cb("info"))],
             ]
         )
         return text_html, kb
@@ -3070,7 +3432,7 @@ def _render_session_view(
         text_html = f"{notice_html}{compact_info}\n\n<i>Send a prompt to start.</i>"
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("⚙️", callback_data=_cb("model"))],
+                [InlineKeyboardButton("⚙️", callback_data=_cb("model")), InlineKeyboardButton("ℹ️", callback_data=_cb("info"))],
                 [InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back")), InlineKeyboardButton("🗑", callback_data=_cb("delete"))],
             ]
         )
@@ -3135,6 +3497,7 @@ def _render_session_view(
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🆕", callback_data=_cb("clear")), InlineKeyboardButton("⚙️", callback_data=_cb("model"))],
+            [InlineKeyboardButton("ℹ️", callback_data=_cb("info"))],
             [InlineKeyboardButton(LABEL_BACK, callback_data=_cb("back")), InlineKeyboardButton("🗑", callback_data=_cb("delete"))],
         ]
     )
@@ -3181,8 +3544,16 @@ def _render_current(manager: SessionManager, *, chat_data: Dict[str, Any]) -> Tu
         return _render_sessions_list(manager, chat_data=chat_data, notice=notice)
     if mode == "new_name":
         return _render_new_name(manager, chat_data=chat_data, notice=notice)
+    if mode == "new_engine":
+        return _render_new_engine(chat_data=chat_data, notice=notice)
     if mode == "new_path":
         return _render_new_path(manager, chat_data=chat_data, notice=notice, notice_code=notice_code)
+    if mode == "info":
+        session_name = ui.get("session")
+        rec = manager.sessions.get(session_name) if isinstance(session_name, str) else None
+        if rec:
+            return _render_info(rec, notice=notice)
+        return _render_sessions_list(manager, chat_data=chat_data, notice="No session selected.")
     if mode == "paths":
         return _render_paths(manager, chat_data=chat_data, notice=notice)
     if mode == "paths_add":
@@ -3198,6 +3569,7 @@ def _render_current(manager: SessionManager, *, chat_data: Dict[str, Any]) -> Tu
                 run_mode=run_mode,
                 model=(rec.model if rec else None),
                 reasoning_effort=(rec.reasoning_effort if rec else None),
+                engine=(rec.engine if rec else None),
                 path=(rec.path if rec else None),
                 notice=notice,
             )
@@ -3544,7 +3916,8 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(tokens) >= 3:
         name = tokens[1]
         path = tokens[2]
-        rec, err = await env.manager.create_session(name=name, path=path)
+        engine = tokens[3] if len(tokens) >= 4 else None
+        rec, err = await env.manager.create_session(name=name, path=path, engine=engine)
         if err:
             _ui_set(context.chat_data, mode="new_name", notice=err)
             await _render_and_sync(env.manager, env.panel, context=context, chat_id=env.chat_id)
@@ -3793,11 +4166,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _ui_set(context.chat_data, mode="new_name", notice="Auto-name is taken. Pick another.")
             await _rerender()
         else:
-            _ui_nav_to(context.chat_data, mode="new_path", new={"name": auto_name})
+            _ui_nav_to(context.chat_data, mode="new_engine", new={"name": auto_name})
+            await _rerender()
+    elif action == "engine":
+        engine_val = (arg or "").strip()
+        if engine_val not in ENGINE_CHOICES:
+            _ui_set(context.chat_data, mode="new_engine", notice="Pick an engine.")
+            await _rerender()
+        else:
+            draft = ui.get("new") if isinstance(ui.get("new"), dict) else {}
+            draft["engine"] = engine_val
+            _log_line(f"engine_selected engine={engine_val}")
+            _ui_nav_to(context.chat_data, mode="new_path", new=draft)
+            await _rerender()
+    elif action == "path_mode":
+        mode_val = (arg or "").strip()
+        if mode_val not in {"docs", "full", "reset"}:
+            _ui_set(context.chat_data, mode="new_path", notice="Выбери вариант ниже.")
+            await _rerender()
+        else:
+            draft = ui.get("new") if isinstance(ui.get("new"), dict) else {}
+            if mode_val == "reset":
+                draft.pop("path_mode", None)
+            else:
+                draft["path_mode"] = mode_val
+            _ui_nav_to(context.chat_data, mode="new_path", new=draft)
             await _rerender()
     elif action == "path_pick":
         draft = ui.get("new")
         name = draft.get("name") if isinstance(draft, dict) else None
+        engine = draft.get("engine") if isinstance(draft, dict) else None
         if not isinstance(name, str) or not name:
             _ui_set(context.chat_data, mode="new_name", notice="Missing draft name. Start again.")
             await _rerender()
@@ -3819,7 +4217,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     _ui_set(context.chat_data, mode="new_path", notice="Папка не найдена.", notice_code=str(resolved_p))
                     await _rerender()
                 else:
-                    rec, err = await manager.create_session(name=name, path=str(resolved_p))
+                    rec, err = await manager.create_session(name=name, path=str(resolved_p), engine=engine)
                     if err:
                         _ui_set(context.chat_data, mode="new_path", notice=err, new={"name": name})
                         await _rerender()
@@ -3848,6 +4246,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _ui_nav_to(context.chat_data, mode="sessions", notice="No session selected.")
         else:
             _ui_nav_to(context.chat_data, mode="logs", session=session_name)
+        await _rerender()
+    elif action == "info":
+        session_name_info = _resolve_session_for_callback_message(
+            manager,
+            chat_id=chat_id,
+            message_id=(query.message.message_id if query.message else None),
+            fallback=ui_session,
+        )
+        if not isinstance(session_name_info, str) or session_name_info not in manager.sessions:
+            _ui_nav_to(context.chat_data, mode="sessions", notice="No session selected.")
+        else:
+            _ui_nav_to(context.chat_data, mode="info", session=session_name_info)
         await _rerender()
     elif action == "log":
         session_name = ui.get("session")
@@ -3927,6 +4337,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _ui_set(context.chat_data, mode="sessions", notice="No session selected.")
             await _rerender()
         else:
+            if rec2.engine == ENGINE_CLAUDE:
+                _ui_set(context.chat_data, mode="model", notice="Model presets are not available for Claude.")
+                await _rerender()
+                return
             try:
                 idx = int(arg or "-1")
             except Exception:
@@ -3945,6 +4359,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _ui_set(context.chat_data, mode="sessions", notice="No session selected.")
             await _rerender()
         else:
+            if rec_v2.engine == ENGINE_CLAUDE:
+                _ui_set(context.chat_data, mode="model", notice="Reasoning effort is not used for Claude.")
+                await _rerender()
+                return
             level = (arg or "").strip()
             if level not in {"low", "medium", "high", "xhigh"}:
                 _ui_set(context.chat_data, mode="model", notice="Invalid reasoning effort.")
@@ -4011,16 +4429,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _ui_set(context.chat_data, mode="confirm_mkdir", notice=f"Failed to create directory: {e}")
             await _rerender()
             return
+        _log_line(f"mkdir_created path={path}")
 
         if flow == "new_path":
             draft = ui.get("new")
             name = draft.get("name") if isinstance(draft, dict) else None
+            engine = draft.get("engine") if isinstance(draft, dict) else None
             if not isinstance(name, str) or not name:
                 ui.pop("mkdir", None)
                 _ui_set(context.chat_data, mode="new_name", notice="Missing draft name. Start again.")
                 await _rerender()
                 return
-            rec, err = await manager.create_session(name=name, path=path)
+            rec, err = await manager.create_session(name=name, path=path, engine=engine)
             if err:
                 _ui_set(context.chat_data, mode="new_path", notice=err, new={"name": name})
                 ui.pop("mkdir", None)
@@ -4443,18 +4863,50 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             _ui_set(context.chat_data, notice="A session with this name already exists.")
             await _rerender()
             return
-        _ui_nav_to(context.chat_data, mode="new_path", new={"name": safe})
+        _ui_nav_to(context.chat_data, mode="new_engine", new={"name": safe})
+        await _rerender()
+        return
+
+    if mode == "new_engine":
+        engine_text = text.strip().lower()
+        engine_val = ""
+        if engine_text in {ENGINE_CODEX, "codex-cli", "codex cli"}:
+            engine_val = ENGINE_CODEX
+        elif engine_text in {ENGINE_CLAUDE, "claude code", "claude-code", "claude"}:
+            engine_val = ENGINE_CLAUDE
+        if not engine_val:
+            _ui_set(context.chat_data, notice="Pick engine: codex or claude.")
+            await _rerender()
+            return
+        draft = ui.get("new") if isinstance(ui.get("new"), dict) else {}
+        draft["engine"] = engine_val
+        _log_line(f"engine_selected engine={engine_val}")
+        _ui_nav_to(context.chat_data, mode="new_path", new=draft)
         await _rerender()
         return
 
     if mode == "new_path":
         draft = ui.get("new")
         name = draft.get("name") if isinstance(draft, dict) else None
+        engine = draft.get("engine") if isinstance(draft, dict) else None
+        path_mode = draft.get("path_mode") if isinstance(draft, dict) else None
         if not isinstance(name, str) or not name:
             _ui_set(context.chat_data, mode="new_name", notice="Missing draft name. Start again.")
             await _rerender()
             return
-        resolved, err = _safe_resolve_path(text)
+        if path_mode not in {"docs", "full"}:
+            _ui_set(context.chat_data, notice="Сначала выбери где работать.")
+            await _rerender()
+            return
+        if path_mode == "docs":
+            if not _is_simple_folder_name(text):
+                _ui_set(context.chat_data, notice="Нужно только имя папки (без слэшей).")
+                await _rerender()
+                return
+            path_text = str(_default_projects_root() / text.strip())
+        else:
+            path_text = text
+        resolved, err = _safe_resolve_path(path_text)
         if err:
             _ui_set(context.chat_data, notice=err, notice_code=text)
             await _rerender()
@@ -4474,7 +4926,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             _ui_set(context.chat_data, notice="Папка не найдена.", notice_code=abs_path)
             await _rerender()
             return
-        rec, err = await manager.create_session(name=name, path=abs_path)
+        rec, err = await manager.create_session(name=name, path=abs_path, engine=engine)
         if err:
             _ui_set(context.chat_data, notice=err, new={"name": name})
             await _rerender()

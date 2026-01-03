@@ -1,9 +1,12 @@
 # vibes
 
-`vibes.py` — Telegram-бот “session manager” для Codex CLI.  
+`vibes.py` — Telegram-бот “session manager” для Codex CLI и Claude Code.  
 `vibes` — CLI-скрипт для запуска/статуса/остановки бота в фоне.
 
-## Самый простой старт (3 шага)
+Это форк с beta-улучшениями UX и поддержкой Claude Code.  
+Оригинальный репозиторий и автор — большие молодцы; мы стараемся бережно расширять функционал.
+
+## Самый простой старт (4 шага)
 
 1) Клонируй репозиторий и зайди в папку:
 
@@ -12,7 +15,13 @@ git clone https://github.com/shlgd/vibes.git
 cd vibes
 ```
 
-2) Запусти установку (одна команда):
+2) Скопируй шаблон окружения и заполни токен:
+
+```bash
+cp .env.example .env
+```
+
+3) Запусти установку (одна команда):
 
 ```bash
 ./setup.sh
@@ -24,7 +33,7 @@ cd vibes
 chmod +x setup.sh
 ```
 
-3) Открой Telegram → напиши боту `/start`
+4) Открой Telegram → напиши боту `/start`
 
 Проверить что работает:
 
@@ -42,13 +51,31 @@ vibes start --restart
 vibes help
 ```
 
+## Что нового в этой beta-ветке
+
+- Выбор движка в мастере создания сессии: **Codex CLI** или **Claude Code**
+- Явный выбор пути: **создать в Documents** или **указать полный путь**
+- Ответы CLI приходят отдельными сообщениями → история диалога сохраняется
+- “Инфо” по сессии теперь в меню (кнопка `ℹ️`), без навязчивых уведомлений
+
 ## Подробности
 
 ### Требования
 
 - `python3` версии **3.10+**
 - `git`
-- `codex` в `PATH` + настроенный API key (без этого бот запустится, но не сможет запускать сессии)
+- `codex` в `PATH` + настроенный API key (для Codex-сессий)
+- `claude` в `PATH` (для Claude Code-сессий)
+
+### Engines: Codex vs Claude
+
+В мастере создания сессии выбираешь движок:
+- **Codex CLI** (по умолчанию)
+- **Claude Code**
+
+Для Claude можно задать:
+- `VIBES_CLAUDE_MODEL=sonnet`
+- `VIBES_CLAUDE_PERMISSION_MODE=bypassPermissions`
 
 ### Как получить Telegram bot token
 
@@ -61,6 +88,36 @@ vibes help
 - Конфиг: `<repo>/.env`
 - Рантайм/стейт: `<repo>/.vibes/daemon.json`
 - Логи демона: `<repo>/.vibes/daemon.log` (удобно: `vibes logs -f`)
+
+### Выбор пути для сессии
+
+- В шаге “Где работать?” есть два варианта:
+  - **Создать в Documents** — ты вводишь только имя папки, она создаётся в `~/Documents`
+  - **Указать полный путь** — ты вводишь директорию целиком
+- Базовую папку можно переопределить: `VIBES_DEFAULT_PROJECTS_DIR=/path/to/projects`
+
+### Пример .env (шаблон)
+
+Смотри файл `.env.example`. Минимально нужно задать `VIBES_TOKEN`.
+
+```bash
+# Telegram bot token (required)
+VIBES_TOKEN=
+
+# Your Telegram numeric user_id (optional)
+# VIBES_ADMIN_ID=
+
+# Codex CLI settings
+VIBES_CODEX_SANDBOX=danger-full-access
+VIBES_CODEX_APPROVAL_POLICY=never
+
+# Claude Code settings
+VIBES_CLAUDE_MODEL=sonnet
+VIBES_CLAUDE_PERMISSION_MODE=bypassPermissions
+
+# Optional: default projects root (overrides ~/Documents)
+# VIBES_DEFAULT_PROJECTS_DIR=~/Documents
+```
 
 ### Uninstall
 
